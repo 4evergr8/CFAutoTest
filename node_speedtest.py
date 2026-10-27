@@ -5,10 +5,16 @@ new Env('CF 节点测速')
 
 节点延迟 + 下载速度批量筛选
 
-流程: 下载列表 -> 解析去重 -> 并发 TCP 延迟 -> 串行下载测速 -> 写 txt/csv -> git 提交推送
+流程: 下载列表 -> 解析去重 -> 并发 TCP 延迟 -> 串行下载测速 -> 写 txt/csv -> 上传 GitHub Release
 
 整个流程包在一个 try 里, 只有出错时才推送通知(成功不推)。
 需要与青龙的 notify.py 放在同一目录(默认 /ql/data/scripts/)。
+
+环境变量:
+    GITHUB_REPO   owner/repo, 例 4evergr8/CFAutoTest
+    GITHUB_TOKEN  有 repo 权限的 PAT
+    RELEASE_TAG   Release 标签, 默认 latest(固定, 每次覆盖附件)
+    RELEASE_NAME  Release 标题, 可选
 
 用法:
     python node_speedtest.py            # 全量跑
@@ -17,13 +23,15 @@ new Env('CF 节点测速')
 import argparse
 import asyncio
 import csv
+import json
+import os
 import re
 import socket
 import ssl
-import subprocess
 import sys
 import time
 import traceback
+import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 from pathlib import Path
@@ -57,11 +65,10 @@ OUT_TXT = "result.txt"
 OUT_CSV = "result.csv"
 LIST_FILE = "all.txt"
 
-GIT_PULL = True               # 运行前是否先拉取远程更新
-GIT_PUSH = True               # 跑完是否自动提交并推送
-GIT_BRANCH = "main"
-GIT_USER = "4evergr8"
-GIT_EMAIL = "137018415+4evergr8@users.noreply.github.com"
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "")        # 例: 4evergr8/CFAutoTest
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")      # 需要 repo 权限的 PAT
+RELEASE_TAG = os.environ.get("RELEASE_TAG", "latest")  # 固定 tag, 每次覆盖里面的附件
+RELEASE_NAME = os.environ.get("RELEASE_NAME", "SpeedTest Results")
 
 # ============================================================
 
@@ -81,12 +88,6 @@ def fmt_dur(sec):
     if sec < 3600:
         return f"{sec / 60:.1f}min"
     return f"{sec / 3600:.1f}h"
-
-
-def sh(cmd):
-    """在脚本所在目录执行 shell 命令"""
-    return subprocess.run(cmd, cwd=str(BASE), shell=True,
-                          capture_output=True, text=True, timeout=180)
 
 
 # ---------------- 并发 TCP 延迟 ----------------
@@ -213,21 +214,13 @@ def main():
         print(f"  提前终止  : {EARLY_STOP_SEC:.1f} s (样本未下完即不可能达标)")
         print(f"  每国配额  : {MAX_PER_COUNTRY} 个达标后切换国家")
         print(f"  输出目录  : {BASE / OUT_DIR} ({OUT_TXT} / {OUT_CSV})")
-        print(f"  自动推送  : {'开' if GIT_PUSH else '关'} (分支 {GIT_BRANCH})")
+        if GITHUB_REPO and GITHUB_TOKEN:
+            print(f"  Release   : {GITHUB_REPO} @ {RELEASE_TAG}")
+        else:
+            print(f"  Release   : 未配置 (需 GITHUB_REPO / GITHUB_TOKEN)")
         print("=" * 68 + "\n")
 
         qualified = []
-
-        # ---- 0.5 运行前先拉取远程更新 ----
-        if GIT_PULL:
-            stage = "git 拉取"
-            print("[git] 拉取远程更新")
-            r = sh(f"git pull --rebase --autostash origin {GIT_BRANCH}")
-            if r.returncode != 0:
-                print(f"[git] 拉取失败(继续执行): {r.stderr.strip()[:200]}")
-            else:
-                tail = (r.stdout.strip().splitlines() or ["已完成"])[-1]
-                print(f"[git] {tail}\n")
 
         # ---- 1. 下载列表(强制直连, 忽略系统代理) ----
         stage = "下载列表"
@@ -411,23 +404,94 @@ def main():
         print(f"txt: {txt_path}")
         print(f"csv: {csv_path}")
 
-        # ---- 8. 提交并推送 ----
-        stage = "git 推送"
-        if GIT_PUSH:
-            print("\n[git] 检查变更")
-            sh(f"git add -A -- {OUT_TXT} {OUT_CSV}")
-            if sh("git diff --cached --quiet").returncode == 0:
-                print("[git] 结果无变化, 跳过提交")
+        # ---- 8. 上传到 GitHub Release ----
+        stage = "上传 Release"
+        if not (GITHUB_REPO and GITHUB_TOKEN):
+            print("\n[release] 未配置 GITHUB_REPO / GITHUB_TOKEN, 跳过上传")
+        else:
+            tested_all = sum(1 for r in rows if "speed" in r)
+            lines = [
+                f"耗时 {fmt_dur(time.perf_counter() - t0)} | 已测 {tested_all} 个 "
+                f"| 下载 {size_str}",
+                f"合格节点 (>= {SPEED_MIN_MBPS} MB/s): {len(qualified)} 个",
+                "",
+            ]
+            for tag in COUNTRIES:
+                qs = [r for r in qualified if r["tag"] == tag]
+                lines.append(f"- {tag}: {len(qs)} 个")
+            if qualified:
+                lines.append("")
+                for r in qualified[:30]:
+                    lines.append(f"`{r['ip']}:{r['port']}` {r['speed']:.2f} MB/s [{r['tag']}]")
+                if len(qualified) > 30:
+                    lines.append(f"... 其余 {len(qualified) - 30} 个见附件 result.txt")
             else:
-                msg = f"update: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-                r = sh(f'git -c user.name="{GIT_USER}" -c user.email="{GIT_EMAIL}" '
-                       f'commit -q -m "{msg}"')
-                if r.returncode != 0:
-                    raise RuntimeError(f"git commit 失败: {r.stderr.strip()}")
-                r = sh(f"git push origin {GIT_BRANCH}")
-                if r.returncode != 0:
-                    raise RuntimeError(f"git push 失败: {r.stderr.strip()[:200]}")
-                print(f"[git] 已推送 {GIT_BRANCH}")
+                lines.append("")
+                lines.append("本轮无节点达到速度阈值")
+            summary = "\n".join(lines)
+
+            api = f"https://api.github.com/repos/{GITHUB_REPO}"
+            hdr = {
+                "Authorization": f"Bearer {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": UA,
+            }
+
+            def gh(path, method="GET", payload=None, raw=None, ctype=None):
+                url = path if path.startswith("http") else api + path
+                data = raw if raw is not None else (
+                    json.dumps(payload).encode() if payload is not None else None)
+                rq = urllib.request.Request(url, data=data, method=method)
+                for k, v in hdr.items():
+                    rq.add_header(k, v)
+                if ctype:
+                    rq.add_header("Content-Type", ctype)
+                try:
+                    with urllib.request.urlopen(rq, timeout=90) as rp:
+                        return rp.status, rp.read()
+                except urllib.error.HTTPError as he:
+                    return he.code, he.read()
+
+            # 取或建 release
+            st, rb = gh(f"/releases/tags/{RELEASE_TAG}")
+            if st == 200:
+                rel_id = json.loads(rb)["id"]
+                gh(f"/releases/{rel_id}", "PATCH", {"name": RELEASE_NAME, "body": summary})
+                print(f"\n[release] 复用已有 release: {RELEASE_TAG}")
+            else:
+                st, rb = gh("/releases", "POST", {
+                    "tag_name": RELEASE_TAG,
+                    "name": RELEASE_NAME,
+                    "body": summary,
+                    "draft": False,
+                    "prerelease": False,
+                })
+                if st not in (200, 201):
+                    raise RuntimeError(f"创建 release 失败 HTTP {st}: {rb[:200]}")
+                rel_id = json.loads(rb)["id"]
+                print(f"\n[release] 已创建 release: {RELEASE_TAG}")
+
+            # 删掉同名旧附件
+            st, rb = gh(f"/releases/{rel_id}/assets")
+            if st == 200:
+                for a in json.loads(rb):
+                    if a["name"] in (OUT_TXT, OUT_CSV):
+                        gh(f"/releases/assets/{a['id']}", "DELETE")
+                        print(f"[release] 删除旧附件 {a['name']}")
+
+            # 上传新附件
+            for fp in (txt_path, csv_path):
+                st, rb = gh(
+                    f"https://uploads.github.com/repos/{GITHUB_REPO}"
+                    f"/releases/{rel_id}/assets?name={fp.name}",
+                    "POST", raw=fp.read_bytes(), ctype="application/octet-stream")
+                if st not in (200, 201):
+                    raise RuntimeError(f"上传 {fp.name} 失败 HTTP {st}: {rb[:200]}")
+                print(f"[release] 已上传 {fp.name} ({fp.stat().st_size} 字节)")
+
+            print(f"[release] 下载地址: "
+                  f"https://github.com/{GITHUB_REPO}/releases/download/{RELEASE_TAG}/{OUT_TXT}")
 
         print(f"\n全部完成, 用时 {fmt_dur(time.perf_counter() - t0)}")
 
