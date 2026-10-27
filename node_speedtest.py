@@ -15,6 +15,7 @@ new Env('CF 节点测速')
     GITHUB_TOKEN  有 repo 权限的 PAT
     RELEASE_TAG   Release 标签, 默认 latest(固定, 每次覆盖附件)
     RELEASE_NAME  Release 标题, 可选
+    PROXY         下载/上传用的代理, 例 192.168.123.100:7890 (先走代理, 失败再直连)
 
 用法:
     python node_speedtest.py            # 全量跑
@@ -70,6 +71,11 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")      # 需要 repo 权限的 P
 RELEASE_TAG = os.environ.get("RELEASE_TAG", "latest")  # 固定 tag, 每次覆盖里面的附件
 RELEASE_NAME = os.environ.get("RELEASE_NAME", "SpeedTest Results")
 
+PROXY = os.environ.get("PROXY", "").strip()            # 例: 192.168.123.100:7890
+PROXY_URL = PROXY if ("://" in PROXY or not PROXY) else f"http://{PROXY}"
+NET_TIMEOUT = 5.0             # 下载列表的单次超时(秒)
+API_TIMEOUT = 15.0            # 调用 GitHub API 的超时(秒), 上传附件留些余量
+
 # ============================================================
 
 BASE = Path(__file__).resolve().parent
@@ -88,6 +94,37 @@ def fmt_dur(sec):
     if sec < 3600:
         return f"{sec / 60:.1f}min"
     return f"{sec / 3600:.1f}h"
+
+
+def fetch(req, timeout=NET_TIMEOUT):
+    """先走代理, 失败再直连, 各尝试一次。返回 (status, body, err)"""
+    plans = []
+    if PROXY_URL:
+        plans.append(({"http": PROXY_URL, "https": PROXY_URL}, "代理"))
+    plans.append(({}, "直连"))
+
+    def clone():
+        # 每次尝试都用全新的 Request, 复用同一对象会残留上一次的代理状态
+        r = urllib.request.Request(req.full_url, data=req.data, method=req.get_method())
+        for k, v in req.header_items():
+            r.add_header(k, v)
+        for k, v in getattr(req, "unredirected_hdrs", {}).items():
+            r.add_unredirected_header(k, v)
+        return r
+
+    last = None
+    for proxies, name in plans:
+        op = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+        try:
+            with op.open(clone(), timeout=timeout) as r:
+                return r.status, r.read(), None
+        except urllib.error.HTTPError as e:
+            # 能拿到 HTTP 响应说明链路是通的, 不再换路径
+            return e.code, e.read(), None
+        except Exception as e:
+            last = e
+            print(f"[网络] {name}失败: {type(e).__name__}: {e}")
+    return None, b"", last
 
 
 # ---------------- 并发 TCP 延迟 ----------------
@@ -214,32 +251,21 @@ def main():
             print(f"  Release   : {GITHUB_REPO} @ {RELEASE_TAG}")
         else:
             print(f"  Release   : 未配置 (需 GITHUB_REPO / GITHUB_TOKEN)")
+        print(f"  网络代理  : {PROXY_URL or '未配置 (直连)'}")
         print("=" * 68 + "\n")
 
         qualified = []
 
-        # ---- 1. 下载列表(强制直连, 忽略系统代理) ----
+        # ---- 1. 下载列表(先代理, 失败再直连, 各一次) ----
         stage = "下载列表"
         list_path = BASE / LIST_FILE
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        data = None
-        for i in range(3):
-            try:
-                req = urllib.request.Request(
-                    SOURCE_URL, headers={"User-Agent": UA, "Accept": "*/*"})
-                with opener.open(req, timeout=40) as r:
-                    data = r.read()
-                if not data:
-                    raise RuntimeError("返回内容为空")
-                break
-            except Exception as e:
-                print(f"[下载] 第 {i + 1} 次失败: {type(e).__name__}: {e}")
-                if i < 2:
-                    time.sleep(2)
-        else:
-            raise RuntimeError("列表下载失败, 3 次重试均未成功")
+        req = urllib.request.Request(
+            SOURCE_URL, headers={"User-Agent": UA, "Accept": "*/*"})
+        st, data, err = fetch(req, timeout=NET_TIMEOUT)
+        if st != 200 or not data:
+            raise RuntimeError(f"列表下载失败: {err or f'HTTP {st}'}")
         list_path.write_bytes(data)
-        print(f"[下载] 成功, {len(data)} 字节 (直连)\n")
+        print(f"[下载] 成功, {len(data)} 字节\n")
 
         # ---- 2. 解析去重 ----
         stage = "解析列表"
@@ -478,11 +504,10 @@ def main():
                     rq.add_header(k, v)
                 if ctype:
                     rq.add_header("Content-Type", ctype)
-                try:
-                    with urllib.request.urlopen(rq, timeout=90) as rp:
-                        return rp.status, rp.read()
-                except urllib.error.HTTPError as he:
-                    return he.code, he.read()
+                st, body, err = fetch(rq, timeout=API_TIMEOUT)
+                if st is None:
+                    raise RuntimeError(f"请求 {path} 失败: {err}")
+                return st, body
 
             # 取或建 release
             st, rb = gh(f"/releases/tags/{RELEASE_TAG}")
