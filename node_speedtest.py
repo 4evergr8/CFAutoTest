@@ -46,9 +46,9 @@ COUNTRIES = ["JP", "HK", "SG", "TW"]
 PORT = 443
 
 LATENCY_MAX_MS = 800          # TLS 握手耗时上限(注意: 含 TLS, 比纯 TCP RTT 大 3-5 倍)
-PING_TIMEOUT_MS = 2000        # 单次 TLS 握手超时
+PING_TIMEOUT_MS = 1000        # 单次 TLS 握手超时
 PING_ATTEMPTS = 3             # 每个 IP 尝试次数, 取最小值
-PING_CONCURRENCY = 50         # 延迟阶段并发数(TLS 握手吃 CPU, 太高会虚高)
+PING_CONCURRENCY = 20         # 延迟阶段并发数(TLS 握手吃 CPU, 太高会虚高)
 
 TEST_URL = "https://4evergr8.ccwu.cc/00000.zip"
 SPEED_MIN_MBPS = 7.0          # 主阈值: 达到即算合格
