@@ -2,7 +2,10 @@
 """
 节点延迟 + 下载速度批量筛选
 
-流程: 下载列表 -> 解析去重 -> 并发 TCP 延迟 -> 串行下载测速 -> 写 txt/csv -> git 提交推送 -> 通知
+流程: 下载列表 -> 解析去重 -> 并发 TCP 延迟 -> 串行下载测速 -> 写 txt/csv -> git 提交推送
+
+整个流程包在一个 try 里, 只有出错时才推送通知(成功不推)。
+非青龙环境(没有 notify 模块)会静默跳过通知。
 
 用法:
     python node_speedtest.py            # 全量跑
@@ -183,35 +186,36 @@ def speed_test(ip, port):
 
 # ---------------- 主流程 ----------------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--limit", type=int, default=0, help="只测前 N 个节点, 0=全量")
-    args = ap.parse_args()
-
-    est_one = EARLY_STOP_SEC + 1.5
-
-    print("=" * 68)
-    print("节点批量测速")
-    print(f"  测速目标  : {TEST_URL}")
-    print(f"  国家/地区 : {', '.join(COUNTRIES)}")
-    print(f"  端口      : {PORT}")
-    print(f"  延迟筛选  : <= {LATENCY_MAX_MS} ms "
-          f"(TCP {PING_ATTEMPTS} 次取最小, 单次超时 {PING_TIMEOUT_MS} ms, 并发 {PING_CONCURRENCY})")
-    print(f"  速度阈值  : >= {SPEED_MIN_MBPS} MB/s")
-    print(f"  单次样本  : {SPEED_MAX_BYTES // 1024 // 1024} MB")
-    print(f"  单次超时  : {SPEED_TIMEOUT:.0f} s")
-    print(f"  提前终止  : {EARLY_STOP_SEC:.1f} s (样本未下完即不可能达标)")
-    print(f"  每国配额  : {MAX_PER_COUNTRY} 个达标后切换国家")
-    print(f"  输出目录  : {BASE / OUT_DIR} ({OUT_TXT} / {OUT_CSV})")
-    print(f"  自动推送  : {'开' if GIT_PUSH else '关'} (分支 {GIT_BRANCH})")
-    print("=" * 68 + "\n")
-
-    qualified = []
-    title = "节点测速完成"
-    body = ""
-    t0 = time.perf_counter()
-
     try:
+        # ---- 0. 参数与横幅 ----
+        stage = "启动"
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--limit", type=int, default=0, help="只测前 N 个节点, 0=全量")
+        args = ap.parse_args()
+
+        est_one = EARLY_STOP_SEC + 1.5
+        t0 = time.perf_counter()
+
+        print("=" * 68)
+        print("节点批量测速")
+        print(f"  测速目标  : {TEST_URL}")
+        print(f"  国家/地区 : {', '.join(COUNTRIES)}")
+        print(f"  端口      : {PORT}")
+        print(f"  延迟筛选  : <= {LATENCY_MAX_MS} ms "
+              f"(TCP {PING_ATTEMPTS} 次取最小, 单次超时 {PING_TIMEOUT_MS} ms, 并发 {PING_CONCURRENCY})")
+        print(f"  速度阈值  : >= {SPEED_MIN_MBPS} MB/s")
+        print(f"  单次样本  : {SPEED_MAX_BYTES // 1024 // 1024} MB")
+        print(f"  单次超时  : {SPEED_TIMEOUT:.0f} s")
+        print(f"  提前终止  : {EARLY_STOP_SEC:.1f} s (样本未下完即不可能达标)")
+        print(f"  每国配额  : {MAX_PER_COUNTRY} 个达标后切换国家")
+        print(f"  输出目录  : {BASE / OUT_DIR} ({OUT_TXT} / {OUT_CSV})")
+        print(f"  自动推送  : {'开' if GIT_PUSH else '关'} (分支 {GIT_BRANCH})")
+        print("=" * 68 + "\n")
+
+        qualified = []
+
         # ---- 1. 下载列表(强制直连, 忽略系统代理) ----
+        stage = "下载列表"
         list_path = BASE / LIST_FILE
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         data = None
@@ -234,6 +238,7 @@ def main():
         print(f"[下载] 成功, {len(data)} 字节 (直连)\n")
 
         # ---- 2. 解析去重 ----
+        stage = "解析列表"
         seen, rows = set(), []
         with list_path.open(encoding="utf-8", errors="ignore") as f:
             for line in f:
@@ -254,6 +259,7 @@ def main():
         print(f"[解析] 待测 {len(rows)} 个节点 (已按 ip:port 去重)\n")
 
         # ---- 3. 并发 TCP 延迟 ----
+        stage = "延迟测试"
         async def _ping():
             sem = asyncio.Semaphore(PING_CONCURRENCY)
             results = await asyncio.gather(
@@ -273,6 +279,7 @@ def main():
                   f"p90 {lat[int(len(lat) * 0.9) - 1]:.1f} ms")
 
         # ---- 4. 按延迟筛选 ----
+        stage = "延迟筛选"
         targets = [r for r in rows
                    if r["ping_ms"] is not None and r["ping_ms"] <= LATENCY_MAX_MS]
         print(f"[筛选] 延迟 <= {LATENCY_MAX_MS}ms: {len(targets)} 个 "
@@ -284,6 +291,7 @@ def main():
         print()
 
         # ---- 5. 逐国测速 ----
+        stage = "测速"
         out_dir = BASE / OUT_DIR
         out_dir.mkdir(parents=True, exist_ok=True)
         csv_path = out_dir / OUT_CSV
@@ -293,7 +301,6 @@ def main():
         writer.writerow(["ip", "port", "tag", "ping_ms", "speed_MBps",
                          "bytes_MB", "status", "qualified"])
 
-        t_speed = time.perf_counter()
         for ci, tag in enumerate(COUNTRIES, 1):
             group = [r for r in targets if r["tag"] == tag]
             if not group:
@@ -351,6 +358,7 @@ def main():
                           f"| 预计还需 {fmt_dur(used / i * (len(group) - i))}", flush=True)
 
         # ---- 6. 补全未测节点并写 txt ----
+        stage = "写文件"
         for r in rows:
             if "speed" not in r:
                 if r.get("skipped"):
@@ -376,28 +384,24 @@ def main():
         print(f"完成 | 总耗时 {fmt_dur(time.perf_counter() - t0)} | 总下载 {size_str}")
         print(f"合格节点 (>= {SPEED_MIN_MBPS} MB/s): {len(qualified)} 个")
         print(f"{'国家':<8}{'达标':>6}{'最快':>10}{'均值':>10}{'已测':>8}")
-        per_tag = {}
         for tag in COUNTRIES:
             qs = [r for r in qualified if r["tag"] == tag]
             tested = sum(1 for r in rows if r["tag"] == tag and "speed" in r)
             if not qs:
                 print(f"{tag:<8}{0:>6}{'-':>10}{'-':>10}{tested:>8}")
-                per_tag[tag] = 0
                 continue
             sp = [r["speed"] for r in qs]
             print(f"{tag:<8}{len(qs):>6}{max(sp):>10.2f}{sum(sp) / len(sp):>10.2f}{tested:>8}")
-            per_tag[tag] = len(qs)
         print("=" * 68)
         print(f"txt: {txt_path}")
         print(f"csv: {csv_path}")
 
         # ---- 8. 提交并推送 ----
-        git_state = "未启用"
+        stage = "git 推送"
         if GIT_PUSH:
             print("\n[git] 检查变更")
             sh(f"git add -A -- {OUT_TXT} {OUT_CSV}")
             if sh("git diff --cached --quiet").returncode == 0:
-                git_state = "无变化, 未提交"
                 print("[git] 结果无变化, 跳过提交")
             else:
                 msg = f"update: {time.strftime('%Y-%m-%d %H:%M:%S')}"
@@ -408,44 +412,37 @@ def main():
                 r = sh(f"git push origin {GIT_BRANCH}")
                 if r.returncode != 0:
                     raise RuntimeError(f"git push 失败: {r.stderr.strip()[:200]}")
-                git_state = f"已推送 {GIT_BRANCH}"
                 print(f"[git] 已推送 {GIT_BRANCH}")
 
-        # ---- 9. 组织通知内容 ----
-        elapsed = fmt_dur(time.perf_counter() - t0)
-        title = f"节点测速: {len(qualified)} 个达标"
-        lines = [
-            f"耗时 {elapsed} | 已测 {sum(1 for r in rows if 'speed' in r)} 个 "
-            f"| 下载 {size_str}",
-            "  ".join(f"{t} {n}" for t, n in per_tag.items()),
-            f"git: {git_state}",
-            "",
-        ]
-        if qualified:
-            for r in qualified[:15]:
-                lines.append(f"{r['ip']}  {r['speed']:.2f} MB/s  [{r['tag']}]")
-            if len(qualified) > 15:
-                lines.append(f"... 其余 {len(qualified) - 15} 个见 result.txt")
-        else:
-            lines.append("本轮无节点达到速度阈值")
-        body = "\n".join(lines)
+        print(f"\n全部完成, 用时 {fmt_dur(time.perf_counter() - t0)}")
 
     except Exception as e:
-        title = "节点测速失败" + (f" (已产出 {len(qualified)} 个)" if qualified else "")
-        body = f"{type(e).__name__}: {e}\n\n{traceback.format_exc()[-700:]}"
-        print(f"\n[异常] {type(e).__name__}: {e}")
-        traceback.print_exc()
+        # ---- 唯一的通知: 只在出错时推送 ----
+        stage = locals().get("stage", "启动")
+        qual = locals().get("qualified") or []
+        rows = locals().get("rows") or []
+        tested = sum(1 for r in rows if isinstance(r, dict) and "speed" in r)
 
-    # ---- 唯一一次通知 ----
-    try:
-        for p in ("/ql/data/scripts", "/ql/scripts"):
-            if p not in sys.path:
-                sys.path.append(p)
-        from notify import send
-        send(title, body)
-        print(f"[通知] 已推送: {title}")
-    except Exception as e:
-        print(f"[通知] 跳过 ({type(e).__name__}: {e})")
+        title = f"节点测速失败 [{stage}]"
+        body = (
+            f"{type(e).__name__}: {e}\n"
+            f"阶段: {stage} | 已测: {tested} 个 | 已产出: {len(qual)} 个\n\n"
+            f"{traceback.format_exc()[-800:]}"
+        )
+        print(f"\n[异常] {title}")
+        print(body)
+
+        try:
+            for p in ("/ql/data/scripts", "/ql/scripts"):
+                if p not in sys.path:
+                    sys.path.append(p)
+            from notify import send
+            send(title, body)
+            print("[通知] 已推送")
+        except Exception as ne:
+            print(f"[通知] 跳过 ({type(ne).__name__}: {ne})")
+
+        sys.exit(1)
 
 
 if __name__ == "__main__":
