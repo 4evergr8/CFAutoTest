@@ -41,7 +41,7 @@ from pathlib import Path
 # ============================================================
 
 SOURCE_URL = "https://zip.cm.edu.kg/all.txt"
-COUNTRIES = ["JP", "HK", "SG","CN"]
+COUNTRIES = ["JP", "HK", "SG", "CN"]
 PORT = 443
 
 LATENCY_MAX_MS = 200          # 只对延迟 <= 该值的节点测速
@@ -50,8 +50,9 @@ PING_ATTEMPTS = 3             # 每个 IP 尝试次数, 取最小值
 PING_CONCURRENCY = 100        # ping 阶段并发数
 
 TEST_URL = "https://4evergr8.ccwu.cc/00000.zip"
-SPEED_MIN_MBPS = 8.0          # txt 只输出速度 >= 该值的节点
-MAX_PER_COUNTRY = 5           # 单个国家码找到 N 个达标节点后, 立即跳到下一个国家码
+SPEED_MIN_MBPS = 7.0          # 主阈值: 达到即算合格
+LOW_SPEED_MIN_MBPS = 5.0      # 低速阈值: 该国凑不满时用它兜底补齐
+MAX_PER_COUNTRY = 7           # 单个国家码凑够 N 个后, 立即跳到下一个国家码
 SPEED_MAX_BYTES = 25 * 1024 * 1024
 SPEED_TIMEOUT = 10.0          # 单个节点测速总时长上限(秒)
 VERIFY_TLS = True             # 是否校验证书
@@ -208,11 +209,11 @@ def main():
         print(f"  端口      : {PORT}")
         print(f"  延迟筛选  : <= {LATENCY_MAX_MS} ms "
               f"(TCP {PING_ATTEMPTS} 次取最小, 单次超时 {PING_TIMEOUT_MS} ms, 并发 {PING_CONCURRENCY})")
-        print(f"  速度阈值  : >= {SPEED_MIN_MBPS} MB/s")
+        print(f"  速度阈值  : >= {SPEED_MIN_MBPS} MB/s (凑不满时用 >= {LOW_SPEED_MIN_MBPS} MB/s 补齐)")
         print(f"  单次样本  : {SPEED_MAX_BYTES // 1024 // 1024} MB")
         print(f"  单次超时  : {SPEED_TIMEOUT:.0f} s")
         print(f"  提前终止  : {EARLY_STOP_SEC:.1f} s (样本未下完即不可能达标)")
-        print(f"  每国配额  : {MAX_PER_COUNTRY} 个达标后切换国家")
+        print(f"  每国配额  : {MAX_PER_COUNTRY} 个")
         print(f"  输出目录  : {BASE / OUT_DIR} ({OUT_TXT} / {OUT_CSV})")
         if GITHUB_REPO and GITHUB_TOKEN:
             print(f"  Release   : {GITHUB_REPO} @ {RELEASE_TAG}")
@@ -327,7 +328,7 @@ def main():
             for i, r in enumerate(group, 1):
                 if hit >= MAX_PER_COUNTRY:
                     rest = len(group) - i + 1
-                    print(f"  >> {tag} 已达标 {hit} 个, 跳过剩余 {rest} 个, 进入下一个国家 "
+                    print(f"  >> {tag} 已凑够 {hit} 个, 跳过剩余 {rest} 个, 进入下一个国家 "
                           f"(本段用时 {fmt_dur(time.perf_counter() - c_start)})", flush=True)
                     for rr in group[i - 1:]:
                         rr["skipped"] = "country_quota"
@@ -357,6 +358,22 @@ def main():
                                  res["status"], "Y" if q else "N"])
                 csv_f.flush()
 
+            # 该国全部测完仍未凑够, 用低速阈值从高到低补齐
+            if hit < MAX_PER_COUNTRY:
+                main_hit = hit
+                cand = [r for r in group
+                        if r.get("speed") is not None
+                        and LOW_SPEED_MIN_MBPS <= r["speed"] < SPEED_MIN_MBPS]
+                cand.sort(key=lambda x: -x["speed"])
+                picked = cand[: MAX_PER_COUNTRY - hit]
+                for r in picked:
+                    r["fallback"] = True
+                    qualified.append(r)
+                hit += len(picked)
+                print(f"  >> {tag} 全部 {len(group)} 个测完, 主阈值达标 {main_hit} 个, "
+                      f"低速阈值补 {len(picked)} 个, 共 {hit}/{MAX_PER_COUNTRY}"
+                      + ("" if hit >= MAX_PER_COUNTRY else " (仍不足)"), flush=True)
+
                 if i % 20 == 0 and hit < MAX_PER_COUNTRY:
                     used = time.perf_counter() - c_start
                     avg = sum(speeds_here) / len(speeds_here) if speeds_here else 0.0
@@ -365,20 +382,31 @@ def main():
                           f"| 已用 {fmt_dur(used)} "
                           f"| 预计还需 {fmt_dur(used / i * (len(group) - i))}", flush=True)
 
-        # ---- 6. 补全未测节点并写 txt ----
+        # ---- 6. 重写 csv(补上低速补齐标记) 并写 txt ----
         stage = "写文件"
-        for r in rows:
-            if "speed" not in r:
-                if r.get("skipped"):
-                    status = r["skipped"]
-                elif r["ping_ms"] is None:
-                    status = "ping_fail"
-                else:
-                    status = "latency_skip"
-                writer.writerow([r["ip"], r["port"], r["tag"],
+        csv_f.close()
+        with csv_path.open("w", encoding="utf-8-sig", newline="") as f2:
+            w2 = csv.writer(f2)
+            w2.writerow(["ip", "port", "tag", "ping_ms", "speed_MBps",
+                         "bytes_MB", "status", "qualified"])
+            for r in rows:
+                if "speed" not in r:
+                    if r.get("skipped"):
+                        status = r["skipped"]
+                    elif r["ping_ms"] is None:
+                        status = "ping_fail"
+                    else:
+                        status = "latency_skip"
+                    w2.writerow([r["ip"], r["port"], r["tag"],
                                  f"{r['ping_ms']:.1f}" if r["ping_ms"] is not None else "",
                                  "", "", status, "N"])
-        csv_f.close()
+                    continue
+                mark = "Y" if r.get("qualified") else ("L" if r.get("fallback") else "N")
+                w2.writerow([r["ip"], r["port"], r["tag"],
+                             f"{r['ping_ms']:.1f}",
+                             f"{r['speed']:.2f}" if r["speed"] is not None else "",
+                             f"{r['bytes'] / 1024 / 1024:.2f}",
+                             r["status"], mark])
 
         qualified.sort(key=lambda x: -x["speed"])
         with txt_path.open("w", encoding="utf-8") as f:
@@ -388,18 +416,21 @@ def main():
         # ---- 7. 汇总 ----
         total_mb = sum(r.get("bytes", 0) for r in rows) / 1024 / 1024
         size_str = f"{total_mb:.0f} MB" if total_mb < 1024 else f"{total_mb / 1024:.2f} GB"
+        n_low = sum(1 for r in qualified if r.get("fallback"))
         print(f"\n{'=' * 68}")
         print(f"完成 | 总耗时 {fmt_dur(time.perf_counter() - t0)} | 总下载 {size_str}")
-        print(f"合格节点 (>= {SPEED_MIN_MBPS} MB/s): {len(qualified)} 个")
-        print(f"{'国家':<8}{'达标':>6}{'最快':>10}{'均值':>10}{'已测':>8}")
+        print(f"入选节点: {len(qualified)} 个 "
+              f"(主阈值 >= {SPEED_MIN_MBPS}: {len(qualified) - n_low} 个, "
+              f"低速补齐 >= {LOW_SPEED_MIN_MBPS}: {n_low} 个)")
+        print(f"{'国家':<8}{'入选':>6}{'其中低速':>10}{'最快':>10}{'已测':>8}")
         for tag in COUNTRIES:
             qs = [r for r in qualified if r["tag"] == tag]
             tested = sum(1 for r in rows if r["tag"] == tag and "speed" in r)
+            low = sum(1 for r in qs if r.get("fallback"))
             if not qs:
-                print(f"{tag:<8}{0:>6}{'-':>10}{'-':>10}{tested:>8}")
+                print(f"{tag:<8}{0:>6}{0:>10}{'-':>10}{tested:>8}")
                 continue
-            sp = [r["speed"] for r in qs]
-            print(f"{tag:<8}{len(qs):>6}{max(sp):>10.2f}{sum(sp) / len(sp):>10.2f}{tested:>8}")
+            print(f"{tag:<8}{len(qs):>6}{low:>10}{max(r['speed'] for r in qs):>10.2f}{tested:>8}")
         print("=" * 68)
         print(f"txt: {txt_path}")
         print(f"csv: {csv_path}")
@@ -413,16 +444,21 @@ def main():
             lines = [
                 f"耗时 {fmt_dur(time.perf_counter() - t0)} | 已测 {tested_all} 个 "
                 f"| 下载 {size_str}",
-                f"合格节点 (>= {SPEED_MIN_MBPS} MB/s): {len(qualified)} 个",
+                f"入选节点 {len(qualified)} 个 "
+                f"(主阈值 >= {SPEED_MIN_MBPS}: {len(qualified) - n_low} 个, "
+                f"低速补齐 >= {LOW_SPEED_MIN_MBPS}: {n_low} 个)",
                 "",
             ]
             for tag in COUNTRIES:
                 qs = [r for r in qualified if r["tag"] == tag]
-                lines.append(f"- {tag}: {len(qs)} 个")
+                low = sum(1 for r in qs if r.get("fallback"))
+                lines.append(f"- {tag}: {len(qs)} 个" + (f" (含低速 {low} 个)" if low else ""))
             if qualified:
                 lines.append("")
                 for r in qualified[:30]:
-                    lines.append(f"`{r['ip']}:{r['port']}` {r['speed']:.2f} MB/s [{r['tag']}]")
+                    flag = " (低速)" if r.get("fallback") else ""
+                    lines.append(f"`{r['ip']}:{r['port']}` {r['speed']:.2f} MB/s "
+                                 f"[{r['tag']}]{flag}")
                 if len(qualified) > 30:
                     lines.append(f"... 其余 {len(qualified) - 30} 个见附件 result.txt")
             else:
