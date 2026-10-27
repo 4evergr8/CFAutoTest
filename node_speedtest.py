@@ -53,7 +53,7 @@ PING_CONCURRENCY = 50         # 延迟阶段并发数(TLS 握手吃 CPU, 太高�
 TEST_URL = "https://4evergr8.ccwu.cc/00000.zip"
 SPEED_MIN_MBPS = 7.0          # 主阈值: 达到即算合格
 LOW_SPEED_MIN_MBPS = 5.0      # 低速阈值: 该国凑不满时用它兜底补齐
-MAX_PER_COUNTRY = 7           # 单个国家码凑够 N 个后, 立即跳到下一个国家码
+MAX_PER_COUNTRY = 5           # 单个国家码凑够 N 个后, 立即跳到下一个国家码
 SPEED_MAX_BYTES = 25 * 1024 * 1024
 VERIFY_TLS = True             # 是否校验证书
 
