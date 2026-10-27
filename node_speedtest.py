@@ -45,10 +45,10 @@ SOURCE_URL = "https://zip.cm.edu.kg/all.txt"
 COUNTRIES = ["JP", "HK", "SG", "CN"]
 PORT = 443
 
-LATENCY_MAX_MS = 200          # 只对延迟 <= 该值的节点测速
-PING_TIMEOUT_MS = 2000        # 单次 TCP 握手超时
+LATENCY_MAX_MS = 800          # TLS 握手耗时上限(注意: 含 TLS, 比纯 TCP RTT 大 3-5 倍)
+PING_TIMEOUT_MS = 2000        # 单次 TLS 握手超时
 PING_ATTEMPTS = 3             # 每个 IP 尝试次数, 取最小值
-PING_CONCURRENCY = 100        # ping 阶段并发数
+PING_CONCURRENCY = 50         # 延迟阶段并发数(TLS 握手吃 CPU, 太高会虚高)
 
 TEST_URL = "https://4evergr8.ccwu.cc/00000.zip"
 SPEED_MIN_MBPS = 7.0          # 主阈值: 达到即算合格
@@ -86,6 +86,12 @@ if hasattr(sys.stdout, "reconfigure"):
 
 HOST = urlparse(TEST_URL).hostname
 PAT = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d+)#(.*)$")
+
+# 延迟阶段就做完整 TLS 握手(带 SNI), 提前筛掉「TCP 通但不认这个域名」的节点
+TLS_CTX = ssl.create_default_context()
+if not VERIFY_TLS:
+    TLS_CTX.check_hostname = False
+    TLS_CTX.verify_mode = ssl.CERT_NONE
 
 
 def fmt_dur(sec):
@@ -127,15 +133,16 @@ def fetch(req, timeout=NET_TIMEOUT):
     return None, b"", last
 
 
-# ---------------- 并发 TCP 延迟 ----------------
-async def tcp_rtt(ip, port, sem):
+# ---------------- 并发 TLS 握手延迟 ----------------
+async def tls_rtt(ip, port, sem):
     async with sem:
         best = None
         for _ in range(PING_ATTEMPTS):
             t0 = time.perf_counter()
             try:
                 _, w = await asyncio.wait_for(
-                    asyncio.open_connection(ip, port), PING_TIMEOUT_MS / 1000
+                    asyncio.open_connection(ip, port, ssl=TLS_CTX, server_hostname=HOST),
+                    PING_TIMEOUT_MS / 1000
                 )
                 dt = (time.perf_counter() - t0) * 1000
                 w.close()
@@ -241,7 +248,8 @@ def main():
         print(f"  国家/地区 : {', '.join(COUNTRIES)}")
         print(f"  端口      : {PORT}")
         print(f"  延迟筛选  : <= {LATENCY_MAX_MS} ms "
-              f"(TCP {PING_ATTEMPTS} 次取最小, 单次超时 {PING_TIMEOUT_MS} ms, 并发 {PING_CONCURRENCY})")
+              f"(TLS 握手 {PING_ATTEMPTS} 次取最小, 单次超时 {PING_TIMEOUT_MS} ms, "
+              f"并发 {PING_CONCURRENCY})")
         print(f"  速度阈值  : >= {SPEED_MIN_MBPS} MB/s (凑不满时用 >= {LOW_SPEED_MIN_MBPS} MB/s 补齐)")
         print(f"  单次样本  : {SPEED_MAX_BYTES // 1024 // 1024} MB")
         print(f"  提前终止  : {EARLY_STOP_SEC:.1f} s (样本未下完即不可能达标, 兼作 socket 超时)")
@@ -288,12 +296,12 @@ def main():
             rows = rows[: args.limit]
         print(f"[解析] 待测 {len(rows)} 个节点 (已按 ip:port 去重)\n")
 
-        # ---- 3. 并发 TCP 延迟 ----
+        # ---- 3. 并发 TLS 握手延迟 ----
         stage = "延迟测试"
         async def _ping():
             sem = asyncio.Semaphore(PING_CONCURRENCY)
             results = await asyncio.gather(
-                *(tcp_rtt(r["ip"], r["port"], sem) for r in rows))
+                *(tls_rtt(r["ip"], r["port"], sem) for r in rows))
             for r, rtt in zip(rows, results):
                 r["ping_ms"] = rtt
 
@@ -301,8 +309,8 @@ def main():
         asyncio.run(_ping())
         lat = sorted(r["ping_ms"] for r in rows if r["ping_ms"] is not None)
         reachable = len(lat)
-        print(f"[延迟] 完成 {len(rows)} 个 | 可达 {reachable} 个 "
-              f"({reachable / len(rows) * 100:.1f}%) | 不可达 {len(rows) - reachable} 个 "
+        print(f"[延迟] 完成 {len(rows)} 个 | TLS 握手成功 {reachable} 个 "
+              f"({reachable / len(rows) * 100:.1f}%) | 失败 {len(rows) - reachable} 个 "
               f"| 耗时 {time.perf_counter() - t_ping:.1f}s")
         if lat:
             print(f"[延迟] 分布 min {lat[0]:.1f} / 中位 {lat[len(lat) // 2]:.1f} / "
@@ -379,6 +387,14 @@ def main():
                                  res["status"], "Y" if q else "N"])
                 csv_f.flush()
 
+                if i % 20 == 0 and hit < MAX_PER_COUNTRY:
+                    used = time.perf_counter() - c_start
+                    avg = sum(speeds_here) / len(speeds_here) if speeds_here else 0.0
+                    print(f"    ── {tag} {i}/{len(group)} | 命中 {hit}/{MAX_PER_COUNTRY} "
+                          f"| 命中率 {hit / i * 100:.1f}% | 本段均值 {avg:.2f} MB/s "
+                          f"| 已用 {fmt_dur(used)} "
+                          f"| 预计还需 {fmt_dur(used / i * (len(group) - i))}", flush=True)
+
             # 该国全部测完仍未凑够, 用低速阈值从高到低补齐
             if hit < MAX_PER_COUNTRY:
                 main_hit = hit
@@ -394,14 +410,6 @@ def main():
                 print(f"  >> {tag} 全部 {len(group)} 个测完, 主阈值达标 {main_hit} 个, "
                       f"低速阈值补 {len(picked)} 个, 共 {hit}/{MAX_PER_COUNTRY}"
                       + ("" if hit >= MAX_PER_COUNTRY else " (仍不足)"), flush=True)
-
-                if i % 20 == 0 and hit < MAX_PER_COUNTRY:
-                    used = time.perf_counter() - c_start
-                    avg = sum(speeds_here) / len(speeds_here) if speeds_here else 0.0
-                    print(f"    ── {tag} {i}/{len(group)} | 命中 {hit}/{MAX_PER_COUNTRY} "
-                          f"| 命中率 {hit / i * 100:.1f}% | 本段均值 {avg:.2f} MB/s "
-                          f"| 已用 {fmt_dur(used)} "
-                          f"| 预计还需 {fmt_dur(used / i * (len(group) - i))}", flush=True)
 
         # ---- 6. 重写 csv(补上低速补齐标记) 并写 txt ----
         stage = "写文件"
