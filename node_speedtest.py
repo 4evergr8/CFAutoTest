@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """
+cron: 0 0,8,16 * * *
+new Env('CF 节点测速')
+
 节点延迟 + 下载速度批量筛选
 
 流程: 下载列表 -> 解析去重 -> 并发 TCP 延迟 -> 串行下载测速 -> 写 txt/csv -> git 提交推送
 
 整个流程包在一个 try 里, 只有出错时才推送通知(成功不推)。
-非青龙环境(没有 notify 模块)会静默跳过通知。
+需要与青龙的 notify.py 放在同一目录(默认 /ql/data/scripts/)。
 
 用法:
     python node_speedtest.py            # 全量跑
@@ -432,16 +435,9 @@ def main():
         print(f"\n[异常] {title}")
         print(body)
 
-        try:
-            for p in ("/ql/data/scripts", "/ql/scripts"):
-                if p not in sys.path:
-                    sys.path.append(p)
-            from notify import send
-            send(title, body)
-            print("[通知] 已推送")
-        except Exception as ne:
-            print(f"[通知] 跳过 ({type(ne).__name__}: {ne})")
-
+        from notify import send
+        send(title, body)
+        print("[通知] 已推送")
         sys.exit(1)
 
 
