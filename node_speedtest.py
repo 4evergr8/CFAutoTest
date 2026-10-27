@@ -453,10 +453,13 @@ def main():
                 except urllib.error.HTTPError as he:
                     return he.code, he.read()
 
-            # 取或建 release: GitHub 没有 upsert 接口, 只能先查后建,
-            # 但两种情况都在这里收敛成同一个 rel_id, 后续逻辑完全共用
+            # 取或建 release
             st, rb = gh(f"/releases/tags/{RELEASE_TAG}")
-            if st != 200:
+            if st == 200:
+                rel_id = json.loads(rb)["id"]
+                gh(f"/releases/{rel_id}", "PATCH", {"name": RELEASE_NAME, "body": summary})
+                print(f"\n[release] 复用已有 release: {RELEASE_TAG}")
+            else:
                 st, rb = gh("/releases", "POST", {
                     "tag_name": RELEASE_TAG,
                     "name": RELEASE_NAME,
@@ -466,12 +469,8 @@ def main():
                 })
                 if st not in (200, 201):
                     raise RuntimeError(f"创建 release 失败 HTTP {st}: {rb[:200]}")
-                print(f"\n[release] 已创建 {RELEASE_TAG}")
-            else:
-                print(f"\n[release] 复用已有 {RELEASE_TAG}")
-
-            rel_id = json.loads(rb)["id"]
-            gh(f"/releases/{rel_id}", "PATCH", {"name": RELEASE_NAME, "body": summary})
+                rel_id = json.loads(rb)["id"]
+                print(f"\n[release] 已创建 release: {RELEASE_TAG}")
 
             # 删掉同名旧附件
             st, rb = gh(f"/releases/{rel_id}/assets")
