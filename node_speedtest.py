@@ -72,7 +72,7 @@ RELEASE_TAG = os.environ.get("RELEASE_TAG", "latest")  # 固定 tag, 每次覆�
 RELEASE_NAME = os.environ.get("RELEASE_NAME", "SpeedTest Results")
 
 PROXY = os.environ.get("PROXY", "").strip()            # 例: 192.168.123.100:7890
-PROXY_URL = PROXY if ("://" in PROXY or not PROXY) else f"http://{PROXY}"
+PROXY_URL = f"http://{PROXY}" if PROXY else ""
 NET_TIMEOUT = 5.0             # 下载列表的单次超时(秒)
 API_TIMEOUT = 15.0            # 调用 GitHub API 的超时(秒), 上传附件留些余量
 
