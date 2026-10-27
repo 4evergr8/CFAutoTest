@@ -2,7 +2,7 @@
 """
 节点延迟 + 下载速度批量筛选
 
-流程: 下载列表 -> 解析去重 -> 直连自检 -> 并发 TCP 延迟 -> 串行下载测速 -> 输出 txt/csv
+流程: 下载列表 -> 解析去重 -> 并发 TCP 延迟 -> 串行下载测速 -> 写 txt/csv -> git 提交推送 -> 通知
 
 用法:
     python node_speedtest.py            # 全量跑
@@ -14,8 +14,10 @@ import csv
 import re
 import socket
 import ssl
+import subprocess
 import sys
 import time
+import traceback
 import urllib.request
 from urllib.parse import urlparse
 from pathlib import Path
@@ -49,6 +51,11 @@ OUT_TXT = "result.txt"
 OUT_CSV = "result.csv"
 LIST_FILE = "all.txt"
 
+GIT_PUSH = True               # 跑完是否自动提交并推送
+GIT_BRANCH = "main"
+GIT_USER = "4evergr8"
+GIT_EMAIL = "137018415+4evergr8@users.noreply.github.com"
+
 # ============================================================
 
 BASE = Path(__file__).resolve().parent
@@ -61,52 +68,21 @@ HOST = urlparse(TEST_URL).hostname
 PAT = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d+)#(.*)$")
 
 
-# ---------------- 1. 下载列表 ----------------
-def download_list():
-    """强制直连下载, 不使用任何代理(忽略系统代理环境变量)"""
-    path = BASE / LIST_FILE
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-    last_err = None
-    for i in range(3):
-        try:
-            req = urllib.request.Request(
-                SOURCE_URL, headers={"User-Agent": UA, "Accept": "*/*"})
-            with opener.open(req, timeout=40) as r:
-                data = r.read()
-            if not data:
-                raise RuntimeError("返回内容为空")
-            path.write_bytes(data)
-            print(f"[下载] 成功, {len(data)} 字节 (直连)")
-            return path
-        except Exception as e:
-            last_err = e
-            print(f"[下载] 第 {i + 1} 次失败: {type(e).__name__}: {e}")
-            if i < 2:
-                time.sleep(2)
-    sys.exit(f"[下载] 直连失败: {type(last_err).__name__}: {last_err}")
+def fmt_dur(sec):
+    if sec < 60:
+        return f"{sec:.0f}s"
+    if sec < 3600:
+        return f"{sec / 60:.1f}min"
+    return f"{sec / 3600:.1f}h"
 
 
-# ---------------- 2. 解析 ----------------
-def parse(path):
-    seen = set()
-    rows = []
-    with path.open(encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            m = PAT.match(line.strip())
-            if not m:
-                continue
-            ip, port, tag = m.group(1), int(m.group(2)), m.group(3).strip().upper()
-            if port != PORT or tag not in COUNTRIES:
-                continue
-            if (ip, port) in seen:
-                continue
-            seen.add((ip, port))
-            rows.append({"ip": ip, "port": port, "tag": tag})
-    return rows
+def sh(cmd):
+    """在脚本所在目录执行 shell 命令"""
+    return subprocess.run(cmd, cwd=str(BASE), shell=True,
+                          capture_output=True, text=True, timeout=180)
 
 
-# ---------------- 3. 并发 TCP 延迟 ----------------
+# ---------------- 并发 TCP 延迟 ----------------
 async def tcp_rtt(ip, port, sem):
     async with sem:
         best = None
@@ -128,23 +104,7 @@ async def tcp_rtt(ip, port, sem):
         return best
 
 
-async def ping_all(rows):
-    sem = asyncio.Semaphore(PING_CONCURRENCY)
-    t0 = time.perf_counter()
-    results = await asyncio.gather(*(tcp_rtt(r["ip"], r["port"], sem) for r in rows))
-    for r, rtt in zip(rows, results):
-        r["ping_ms"] = rtt
-    lat = sorted(r["ping_ms"] for r in rows if r["ping_ms"] is not None)
-    ok = len(lat)
-    print(f"[延迟] 完成 {len(rows)} 个 | 可达 {ok} 个 ({ok / len(rows) * 100:.1f}%) "
-          f"| 不可达 {len(rows) - ok} 个 | 耗时 {time.perf_counter() - t0:.1f}s")
-    if lat:
-        print(f"[延迟] 分布 min {lat[0]:.1f} / 中位 {lat[len(lat) // 2]:.1f} / "
-              f"p90 {lat[int(len(lat) * 0.9) - 1]:.1f} ms")
-    return rows
-
-
-# ---------------- 4. 串行下载测速 ----------------
+# ---------------- 串行下载测速 ----------------
 def speed_test(ip, port):
     res = {"speed": None, "bytes": 0, "ttfb": None, "status": ""}
     sock = ss = None
@@ -221,21 +181,7 @@ def speed_test(ip, port):
     return res
 
 
-# ---------------- 5. 主流程 ----------------
-def fmt_dur(sec):
-    if sec < 60:
-        return f"{sec:.0f}s"
-    if sec < 3600:
-        return f"{sec / 60:.1f}min"
-    return f"{sec / 3600:.1f}h"
-
-
-def fmt_size(mb):
-    if mb < 1024:
-        return f"{mb:.0f} MB"
-    return f"{mb / 1024:.2f} GB"
-
-
+# ---------------- 主流程 ----------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=0, help="只测前 N 个节点, 0=全量")
@@ -256,131 +202,250 @@ def main():
     print(f"  提前终止  : {EARLY_STOP_SEC:.1f} s (样本未下完即不可能达标)")
     print(f"  每国配额  : {MAX_PER_COUNTRY} 个达标后切换国家")
     print(f"  输出目录  : {BASE / OUT_DIR} ({OUT_TXT} / {OUT_CSV})")
+    print(f"  自动推送  : {'开' if GIT_PUSH else '关'} (分支 {GIT_BRANCH})")
     print("=" * 68 + "\n")
 
-    path = download_list()
-    rows = parse(path)
-    if not rows:
-        sys.exit("[解析] 没有匹配到任何节点")
-    if args.limit:
-        rows = rows[: args.limit]
-    print(f"[解析] 待测 {len(rows)} 个节点 (已按 ip:port 去重)\n")
-
-    asyncio.run(ping_all(rows))
-
-    reachable = sum(1 for r in rows if r["ping_ms"] is not None)
-    targets = [r for r in rows
-               if r["ping_ms"] is not None and r["ping_ms"] <= LATENCY_MAX_MS]
-    print(f"[筛选] 延迟 <= {LATENCY_MAX_MS}ms: {len(targets)} 个 "
-          f"(占可达节点 {len(targets) / max(1, reachable) * 100:.1f}%)")
-    for tag in COUNTRIES:
-        n_all = sum(1 for r in rows if r["tag"] == tag)
-        n_ok = sum(1 for r in targets if r["tag"] == tag)
-        print(f"         {tag}: 候选 {n_all} 个 -> 通过 {n_ok} 个")
-    print()
-
-    out_dir = BASE / OUT_DIR
-    out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / OUT_CSV
-    txt_path = out_dir / OUT_TXT
-    csv_f = csv_path.open("w", encoding="utf-8-sig", newline="")
-    writer = csv.writer(csv_f)
-    writer.writerow(["ip", "port", "tag", "ping_ms", "speed_MBps",
-                     "bytes_MB", "status", "qualified"])
-
     qualified = []
+    title = "节点测速完成"
+    body = ""
     t0 = time.perf_counter()
 
-    for ci, tag in enumerate(COUNTRIES, 1):
-        group = [r for r in targets if r["tag"] == tag]
-        if not group:
-            print(f"[{ci}/{len(COUNTRIES)}] {tag}: 无符合条件的候选, 跳过\n", flush=True)
-            continue
-
-        print(f"{'-' * 68}")
-        print(f"[{ci}/{len(COUNTRIES)}] {tag} | 候选 {len(group)} 个 | 目标 {MAX_PER_COUNTRY} 个 "
-              f"| 最坏耗时约 {fmt_dur(len(group) * est_one)}")
-        print(f"{'-' * 68}", flush=True)
-
-        hit = 0
-        speeds_here = []
-        c_start = time.perf_counter()
-
-        for i, r in enumerate(group, 1):
-            if hit >= MAX_PER_COUNTRY:
-                rest = len(group) - i + 1
-                print(f"  >> {tag} 已达标 {hit} 个, 跳过剩余 {rest} 个, 进入下一个国家 "
-                      f"(本段用时 {fmt_dur(time.perf_counter() - c_start)})", flush=True)
-                for rr in group[i - 1:]:
-                    rr["skipped"] = "country_quota"
+    try:
+        # ---- 1. 下载列表(强制直连, 忽略系统代理) ----
+        list_path = BASE / LIST_FILE
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        data = None
+        for i in range(3):
+            try:
+                req = urllib.request.Request(
+                    SOURCE_URL, headers={"User-Agent": UA, "Accept": "*/*"})
+                with opener.open(req, timeout=40) as r:
+                    data = r.read()
+                if not data:
+                    raise RuntimeError("返回内容为空")
                 break
+            except Exception as e:
+                print(f"[下载] 第 {i + 1} 次失败: {type(e).__name__}: {e}")
+                if i < 2:
+                    time.sleep(2)
+        else:
+            raise RuntimeError("列表下载失败, 3 次重试均未成功")
+        list_path.write_bytes(data)
+        print(f"[下载] 成功, {len(data)} 字节 (直连)\n")
 
-            res = speed_test(r["ip"], r["port"])
-            r.update(res)
-            q = res["speed"] is not None and res["speed"] >= SPEED_MIN_MBPS
-            r["qualified"] = q
-            if q:
-                qualified.append(r)
-                hit += 1
-            if res["speed"] is not None:
-                speeds_here.append(res["speed"])
+        # ---- 2. 解析去重 ----
+        seen, rows = set(), []
+        with list_path.open(encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                m = PAT.match(line.strip())
+                if not m:
+                    continue
+                ip, port, tag = m.group(1), int(m.group(2)), m.group(3).strip().upper()
+                if port != PORT or tag not in COUNTRIES:
+                    continue
+                if (ip, port) in seen:
+                    continue
+                seen.add((ip, port))
+                rows.append({"ip": ip, "port": port, "tag": tag})
+        if not rows:
+            raise RuntimeError("没有匹配到任何节点")
+        if args.limit:
+            rows = rows[: args.limit]
+        print(f"[解析] 待测 {len(rows)} 个节点 (已按 ip:port 去重)\n")
 
-            sp = f"{res['speed']:.2f} MB/s" if res["speed"] is not None else "-"
-            mark = " *" if q else "  "
-            print(f"[{tag} {i:>3}/{len(group)}] {r['ip']:<16} "
-                  f"延迟{r['ping_ms']:>6.1f}ms {sp:>11}{mark} "
-                  f"命中 {hit}/{MAX_PER_COUNTRY} [{res['status']}] "
-                  f"累计 {fmt_dur(time.perf_counter() - t0)}", flush=True)
+        # ---- 3. 并发 TCP 延迟 ----
+        async def _ping():
+            sem = asyncio.Semaphore(PING_CONCURRENCY)
+            results = await asyncio.gather(
+                *(tcp_rtt(r["ip"], r["port"], sem) for r in rows))
+            for r, rtt in zip(rows, results):
+                r["ping_ms"] = rtt
 
-            writer.writerow([r["ip"], r["port"], r["tag"],
-                             f"{r['ping_ms']:.1f}",
-                             f"{res['speed']:.2f}" if res["speed"] is not None else "",
-                             f"{res['bytes'] / 1024 / 1024:.2f}",
-                             res["status"], "Y" if q else "N"])
-            csv_f.flush()
+        t_ping = time.perf_counter()
+        asyncio.run(_ping())
+        lat = sorted(r["ping_ms"] for r in rows if r["ping_ms"] is not None)
+        reachable = len(lat)
+        print(f"[延迟] 完成 {len(rows)} 个 | 可达 {reachable} 个 "
+              f"({reachable / len(rows) * 100:.1f}%) | 不可达 {len(rows) - reachable} 个 "
+              f"| 耗时 {time.perf_counter() - t_ping:.1f}s")
+        if lat:
+            print(f"[延迟] 分布 min {lat[0]:.1f} / 中位 {lat[len(lat) // 2]:.1f} / "
+                  f"p90 {lat[int(len(lat) * 0.9) - 1]:.1f} ms")
 
-            if i % 20 == 0 and hit < MAX_PER_COUNTRY:
-                used = time.perf_counter() - c_start
-                avg = sum(speeds_here) / len(speeds_here) if speeds_here else 0.0
-                print(f"    ── {tag} {i}/{len(group)} | 命中 {hit}/{MAX_PER_COUNTRY} "
-                      f"| 命中率 {hit / i * 100:.1f}% | 本段均值 {avg:.2f} MB/s "
-                      f"| 已用 {fmt_dur(used)} | 预计还需 {fmt_dur(used / i * (len(group) - i))}",
-                      flush=True)
+        # ---- 4. 按延迟筛选 ----
+        targets = [r for r in rows
+                   if r["ping_ms"] is not None and r["ping_ms"] <= LATENCY_MAX_MS]
+        print(f"[筛选] 延迟 <= {LATENCY_MAX_MS}ms: {len(targets)} 个 "
+              f"(占可达节点 {len(targets) / max(1, reachable) * 100:.1f}%)")
+        for tag in COUNTRIES:
+            n_all = sum(1 for r in rows if r["tag"] == tag)
+            n_ok = sum(1 for r in targets if r["tag"] == tag)
+            print(f"         {tag}: 候选 {n_all} 个 -> 通过 {n_ok} 个")
+        print()
 
-    for r in rows:
-        if "speed" not in r:
-            if r.get("skipped"):
-                status = r["skipped"]
-            elif r["ping_ms"] is None:
-                status = "ping_fail"
+        # ---- 5. 逐国测速 ----
+        out_dir = BASE / OUT_DIR
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = out_dir / OUT_CSV
+        txt_path = out_dir / OUT_TXT
+        csv_f = csv_path.open("w", encoding="utf-8-sig", newline="")
+        writer = csv.writer(csv_f)
+        writer.writerow(["ip", "port", "tag", "ping_ms", "speed_MBps",
+                         "bytes_MB", "status", "qualified"])
+
+        t_speed = time.perf_counter()
+        for ci, tag in enumerate(COUNTRIES, 1):
+            group = [r for r in targets if r["tag"] == tag]
+            if not group:
+                print(f"[{ci}/{len(COUNTRIES)}] {tag}: 无符合条件的候选, 跳过\n", flush=True)
+                continue
+
+            print(f"{'-' * 68}")
+            print(f"[{ci}/{len(COUNTRIES)}] {tag} | 候选 {len(group)} 个 "
+                  f"| 目标 {MAX_PER_COUNTRY} 个 | 最坏耗时约 {fmt_dur(len(group) * est_one)}")
+            print(f"{'-' * 68}", flush=True)
+
+            hit = 0
+            speeds_here = []
+            c_start = time.perf_counter()
+
+            for i, r in enumerate(group, 1):
+                if hit >= MAX_PER_COUNTRY:
+                    rest = len(group) - i + 1
+                    print(f"  >> {tag} 已达标 {hit} 个, 跳过剩余 {rest} 个, 进入下一个国家 "
+                          f"(本段用时 {fmt_dur(time.perf_counter() - c_start)})", flush=True)
+                    for rr in group[i - 1:]:
+                        rr["skipped"] = "country_quota"
+                    break
+
+                res = speed_test(r["ip"], r["port"])
+                r.update(res)
+                q = res["speed"] is not None and res["speed"] >= SPEED_MIN_MBPS
+                r["qualified"] = q
+                if q:
+                    qualified.append(r)
+                    hit += 1
+                if res["speed"] is not None:
+                    speeds_here.append(res["speed"])
+
+                sp = f"{res['speed']:.2f} MB/s" if res["speed"] is not None else "-"
+                mark = " *" if q else "  "
+                print(f"[{tag} {i:>3}/{len(group)}] {r['ip']:<16} "
+                      f"延迟{r['ping_ms']:>6.1f}ms {sp:>11}{mark} "
+                      f"命中 {hit}/{MAX_PER_COUNTRY} [{res['status']}] "
+                      f"累计 {fmt_dur(time.perf_counter() - t0)}", flush=True)
+
+                writer.writerow([r["ip"], r["port"], r["tag"],
+                                 f"{r['ping_ms']:.1f}",
+                                 f"{res['speed']:.2f}" if res["speed"] is not None else "",
+                                 f"{res['bytes'] / 1024 / 1024:.2f}",
+                                 res["status"], "Y" if q else "N"])
+                csv_f.flush()
+
+                if i % 20 == 0 and hit < MAX_PER_COUNTRY:
+                    used = time.perf_counter() - c_start
+                    avg = sum(speeds_here) / len(speeds_here) if speeds_here else 0.0
+                    print(f"    ── {tag} {i}/{len(group)} | 命中 {hit}/{MAX_PER_COUNTRY} "
+                          f"| 命中率 {hit / i * 100:.1f}% | 本段均值 {avg:.2f} MB/s "
+                          f"| 已用 {fmt_dur(used)} "
+                          f"| 预计还需 {fmt_dur(used / i * (len(group) - i))}", flush=True)
+
+        # ---- 6. 补全未测节点并写 txt ----
+        for r in rows:
+            if "speed" not in r:
+                if r.get("skipped"):
+                    status = r["skipped"]
+                elif r["ping_ms"] is None:
+                    status = "ping_fail"
+                else:
+                    status = "latency_skip"
+                writer.writerow([r["ip"], r["port"], r["tag"],
+                                 f"{r['ping_ms']:.1f}" if r["ping_ms"] is not None else "",
+                                 "", "", status, "N"])
+        csv_f.close()
+
+        qualified.sort(key=lambda x: -x["speed"])
+        with txt_path.open("w", encoding="utf-8") as f:
+            for r in qualified:
+                f.write(f"{r['ip']}:{r['port']}#{r['tag']} {r['ip']} {r['speed']:.2f}\n")
+
+        # ---- 7. 汇总 ----
+        total_mb = sum(r.get("bytes", 0) for r in rows) / 1024 / 1024
+        size_str = f"{total_mb:.0f} MB" if total_mb < 1024 else f"{total_mb / 1024:.2f} GB"
+        print(f"\n{'=' * 68}")
+        print(f"完成 | 总耗时 {fmt_dur(time.perf_counter() - t0)} | 总下载 {size_str}")
+        print(f"合格节点 (>= {SPEED_MIN_MBPS} MB/s): {len(qualified)} 个")
+        print(f"{'国家':<8}{'达标':>6}{'最快':>10}{'均值':>10}{'已测':>8}")
+        per_tag = {}
+        for tag in COUNTRIES:
+            qs = [r for r in qualified if r["tag"] == tag]
+            tested = sum(1 for r in rows if r["tag"] == tag and "speed" in r)
+            if not qs:
+                print(f"{tag:<8}{0:>6}{'-':>10}{'-':>10}{tested:>8}")
+                per_tag[tag] = 0
+                continue
+            sp = [r["speed"] for r in qs]
+            print(f"{tag:<8}{len(qs):>6}{max(sp):>10.2f}{sum(sp) / len(sp):>10.2f}{tested:>8}")
+            per_tag[tag] = len(qs)
+        print("=" * 68)
+        print(f"txt: {txt_path}")
+        print(f"csv: {csv_path}")
+
+        # ---- 8. 提交并推送 ----
+        git_state = "未启用"
+        if GIT_PUSH:
+            print("\n[git] 检查变更")
+            sh(f"git add -A -- {OUT_TXT} {OUT_CSV}")
+            if sh("git diff --cached --quiet").returncode == 0:
+                git_state = "无变化, 未提交"
+                print("[git] 结果无变化, 跳过提交")
             else:
-                status = "latency_skip"
-            writer.writerow([r["ip"], r["port"], r["tag"],
-                             f"{r['ping_ms']:.1f}" if r["ping_ms"] is not None else "",
-                             "", "", status, "N"])
-    csv_f.close()
+                msg = f"update: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                r = sh(f'git -c user.name="{GIT_USER}" -c user.email="{GIT_EMAIL}" '
+                       f'commit -q -m "{msg}"')
+                if r.returncode != 0:
+                    raise RuntimeError(f"git commit 失败: {r.stderr.strip()}")
+                r = sh(f"git push origin {GIT_BRANCH}")
+                if r.returncode != 0:
+                    raise RuntimeError(f"git push 失败: {r.stderr.strip()[:200]}")
+                git_state = f"已推送 {GIT_BRANCH}"
+                print(f"[git] 已推送 {GIT_BRANCH}")
 
-    qualified.sort(key=lambda x: -x["speed"])
-    with txt_path.open("w", encoding="utf-8") as f:
-        for r in qualified:
-            f.write(f"{r['ip']}:{r['port']}#{r['tag']} {r['ip']} {r['speed']:.2f}\n")
+        # ---- 9. 组织通知内容 ----
+        elapsed = fmt_dur(time.perf_counter() - t0)
+        title = f"节点测速: {len(qualified)} 个达标"
+        lines = [
+            f"耗时 {elapsed} | 已测 {sum(1 for r in rows if 'speed' in r)} 个 "
+            f"| 下载 {size_str}",
+            "  ".join(f"{t} {n}" for t, n in per_tag.items()),
+            f"git: {git_state}",
+            "",
+        ]
+        if qualified:
+            for r in qualified[:15]:
+                lines.append(f"{r['ip']}  {r['speed']:.2f} MB/s  [{r['tag']}]")
+            if len(qualified) > 15:
+                lines.append(f"... 其余 {len(qualified) - 15} 个见 result.txt")
+        else:
+            lines.append("本轮无节点达到速度阈值")
+        body = "\n".join(lines)
 
-    total_mb = sum(r.get("bytes", 0) for r in rows) / 1024 / 1024
-    print(f"\n{'=' * 68}")
-    print(f"完成 | 总耗时 {fmt_dur(time.perf_counter() - t0)} | 总下载 {fmt_size(total_mb)}")
-    print(f"合格节点 (>= {SPEED_MIN_MBPS} MB/s): {len(qualified)} 个")
-    print(f"{'国家':<8}{'达标':>6}{'最快':>10}{'均值':>10}{'已测':>8}")
-    for tag in COUNTRIES:
-        qs = [r for r in qualified if r["tag"] == tag]
-        tested = sum(1 for r in rows if r["tag"] == tag and "speed" in r)
-        if not qs:
-            print(f"{tag:<8}{0:>6}{'-':>10}{'-':>10}{tested:>8}")
-            continue
-        sp = [r["speed"] for r in qs]
-        print(f"{tag:<8}{len(qs):>6}{max(sp):>10.2f}{sum(sp) / len(sp):>10.2f}{tested:>8}")
-    print("=" * 68)
-    print(f"txt: {txt_path}")
-    print(f"csv: {csv_path}")
+    except Exception as e:
+        title = "节点测速失败" + (f" (已产出 {len(qualified)} 个)" if qualified else "")
+        body = f"{type(e).__name__}: {e}\n\n{traceback.format_exc()[-700:]}"
+        print(f"\n[异常] {type(e).__name__}: {e}")
+        traceback.print_exc()
+
+    # ---- 唯一一次通知 ----
+    try:
+        for p in ("/ql/data/scripts", "/ql/scripts"):
+            if p not in sys.path:
+                sys.path.append(p)
+        from notify import send
+        send(title, body)
+        print(f"[通知] 已推送: {title}")
+    except Exception as e:
+        print(f"[通知] 跳过 ({type(e).__name__}: {e})")
 
 
 if __name__ == "__main__":
