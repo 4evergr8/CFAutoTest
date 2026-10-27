@@ -54,7 +54,6 @@ SPEED_MIN_MBPS = 7.0          # 主阈值: 达到即算合格
 LOW_SPEED_MIN_MBPS = 5.0      # 低速阈值: 该国凑不满时用它兜底补齐
 MAX_PER_COUNTRY = 7           # 单个国家码凑够 N 个后, 立即跳到下一个国家码
 SPEED_MAX_BYTES = 25 * 1024 * 1024
-SPEED_TIMEOUT = 10.0          # 单个节点测速总时长上限(秒)
 VERIFY_TLS = True             # 是否校验证书
 
 # 提前终止时间由阈值推导: 25MB 若要达到 8 MB/s 必须在 3.125s 内下完,
@@ -117,16 +116,17 @@ async def tcp_rtt(ip, port, sem):
 def speed_test(ip, port):
     res = {"speed": None, "bytes": 0, "ttfb": None, "status": ""}
     sock = ss = None
-    deadline = time.perf_counter() + SPEED_TIMEOUT
     try:
-        sock = socket.create_connection((ip, port), timeout=SPEED_TIMEOUT)
-        sock.settimeout(max(0.5, deadline - time.perf_counter()))
+        # 所有 socket 操作都以提前终止时间为上限, 不再单独设总超时
+        sock = socket.create_connection((ip, port), timeout=EARLY_STOP_SEC)
+        sock.settimeout(EARLY_STOP_SEC)
 
         ctx = ssl.create_default_context()
         if not VERIFY_TLS:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         ss = ctx.wrap_socket(sock, server_hostname=HOST)
+        ss.settimeout(EARLY_STOP_SEC)
 
         req = (
             f"GET {urlparse(TEST_URL).path} HTTP/1.1\r\n"
@@ -139,15 +139,15 @@ def speed_test(ip, port):
         ss.sendall(req.encode())
 
         buf = b""
-        while b"\r\n\r\n" not in buf:
-            if time.perf_counter() > deadline:
-                res["status"] = "ttfb_timeout"
-                return res
-            ss.settimeout(max(0.5, deadline - time.perf_counter()))
-            d = ss.recv(4096)
-            if not d:
-                break
-            buf += d
+        try:
+            while b"\r\n\r\n" not in buf:
+                d = ss.recv(4096)
+                if not d:
+                    break
+                buf += d
+        except socket.timeout:
+            res["status"] = "ttfb_timeout"
+            return res
         head, _, rest = buf.partition(b"\r\n\r\n")
         code = head.split(b"\r\n")[0].decode(errors="ignore") if head else ""
         if " 2" not in code:
@@ -161,10 +161,6 @@ def speed_test(ip, port):
             if time.perf_counter() - t_start > EARLY_STOP_SEC:
                 aborted = True
                 break
-            remain = deadline - time.perf_counter()
-            if remain <= 0:
-                break
-            ss.settimeout(min(remain, 3.0))
             try:
                 d = ss.recv(65536)
             except socket.timeout:
@@ -211,8 +207,7 @@ def main():
               f"(TCP {PING_ATTEMPTS} 次取最小, 单次超时 {PING_TIMEOUT_MS} ms, 并发 {PING_CONCURRENCY})")
         print(f"  速度阈值  : >= {SPEED_MIN_MBPS} MB/s (凑不满时用 >= {LOW_SPEED_MIN_MBPS} MB/s 补齐)")
         print(f"  单次样本  : {SPEED_MAX_BYTES // 1024 // 1024} MB")
-        print(f"  单次超时  : {SPEED_TIMEOUT:.0f} s")
-        print(f"  提前终止  : {EARLY_STOP_SEC:.1f} s (样本未下完即不可能达标)")
+        print(f"  提前终止  : {EARLY_STOP_SEC:.1f} s (样本未下完即不可能达标, 兼作 socket 超时)")
         print(f"  每国配额  : {MAX_PER_COUNTRY} 个")
         print(f"  输出目录  : {BASE / OUT_DIR} ({OUT_TXT} / {OUT_CSV})")
         if GITHUB_REPO and GITHUB_TOKEN:
