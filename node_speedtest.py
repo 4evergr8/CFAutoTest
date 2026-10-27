@@ -41,7 +41,7 @@ from pathlib import Path
 # ============================================================
 
 SOURCE_URL = "https://zip.cm.edu.kg/all.txt"
-COUNTRIES = ["JP", "HK", "SG"]
+COUNTRIES = ["JP", "HK", "SG","CN"]
 PORT = 443
 
 LATENCY_MAX_MS = 200          # 只对延迟 <= 该值的节点测速
