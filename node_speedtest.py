@@ -42,10 +42,10 @@ from pathlib import Path
 # ============================================================
 
 SOURCE_URL = "https://zip.cm.edu.kg/all.txt"
-COUNTRIES = ["JP", "HK", "SG",]
+COUNTRIES = ["JP", "HK", "SG", "TW"]
 PORT = 443
 
-LATENCY_MAX_MS = 500          # TLS 握手耗时上限(注意: 含 TLS, 比纯 TCP RTT 大 3-5 倍)
+LATENCY_MAX_MS = 800          # TLS 握手耗时上限(注意: 含 TLS, 比纯 TCP RTT 大 3-5 倍)
 PING_TIMEOUT_MS = 2000        # 单次 TLS 握手超时
 PING_ATTEMPTS = 3             # 每个 IP 尝试次数, 取最小值
 PING_CONCURRENCY = 50         # 延迟阶段并发数(TLS 握手吃 CPU, 太高会虚高)
