@@ -57,6 +57,7 @@ OUT_TXT = "result.txt"
 OUT_CSV = "result.csv"
 LIST_FILE = "all.txt"
 
+GIT_PULL = True               # 运行前是否先拉取远程更新
 GIT_PUSH = True               # 跑完是否自动提交并推送
 GIT_BRANCH = "main"
 GIT_USER = "4evergr8"
@@ -216,6 +217,17 @@ def main():
         print("=" * 68 + "\n")
 
         qualified = []
+
+        # ---- 0.5 运行前先拉取远程更新 ----
+        if GIT_PULL:
+            stage = "git 拉取"
+            print("[git] 拉取远程更新")
+            r = sh(f"git pull --rebase --autostash origin {GIT_BRANCH}")
+            if r.returncode != 0:
+                print(f"[git] 拉取失败(继续执行): {r.stderr.strip()[:200]}")
+            else:
+                tail = (r.stdout.strip().splitlines() or ["已完成"])[-1]
+                print(f"[git] {tail}\n")
 
         # ---- 1. 下载列表(强制直连, 忽略系统代理) ----
         stage = "下载列表"
