@@ -147,7 +147,8 @@ async def tls_rtt(ip, port, sem):
                 dt = (time.perf_counter() - t0) * 1000
                 w.close()
                 try:
-                    await w.wait_closed()
+                    # 必须限时, SSL 关闭握手可能一直不返回, 卡死整个并发池
+                    await asyncio.wait_for(w.wait_closed(), 0.3)
                 except Exception:
                     pass
                 best = dt if best is None else min(best, dt)
