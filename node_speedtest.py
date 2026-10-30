@@ -42,7 +42,7 @@ from pathlib import Path
 # ============================================================
 
 SOURCE_URL = "https://zip.cm.edu.kg/all.txt"
-COUNTRIES = ["JP", "HK", "SG", "TW"]
+COUNTRIES = ["JP", "HK", "SG"]
 PORT = 443
 
 LATENCY_MAX_MS = 800          # TLS 握手耗时上限(注意: 含 TLS, 比纯 TCP RTT 大 3-5 倍)
