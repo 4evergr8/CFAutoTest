@@ -278,7 +278,7 @@ def main():
 
         with txt_path.open("w", encoding="utf-8") as f:
             for r in picked:
-                f.write(f"{r['ip']}:{PORT}#{best['cidr']} {r['ip']} {r['ping_ms']:.1f}\n")
+                f.write(f"{r['ip']}:{PORT}#{r['ip']} {r['ping_ms']:.1f}\n")
 
         with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
