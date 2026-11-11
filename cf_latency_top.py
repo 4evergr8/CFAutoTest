@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 cron: 0 3,8,13,18,23 * * *
-new Env('CF 延迟优选')
+new Env('CF 官方优选')
 
 两阶段延迟优选（不测下载速度）
 
@@ -42,7 +42,7 @@ PORT = 443
 TEST_URL = "https://4evergr8.ccwu.cc/00000.zip"   # 决定 TLS 握手的 SNI
 
 RANGE_SAMPLE = 20             # 第一阶段: 每个网段抽几个 IP 用于比较通率
-SAMPLE_TOTAL = 200            # 第二阶段: 最优网段里随机抽几个 IP
+SAMPLE_TOTAL = 500            # 第二阶段: 最优网段里随机抽几个 IP
 PING_ATTEMPTS = 3             # 每个 IP 测几次(取平均), 任一次失败即判定不可靠
 PING_TIMEOUT_MS = 1000        # 单次 TLS 握手超时
 PING_CONCURRENCY = 50         # 并发数
