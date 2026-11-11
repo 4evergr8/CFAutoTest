@@ -47,7 +47,7 @@ PING_ATTEMPTS = 3             # 每个 IP 测几次(取平均), 任一次失败�
 PING_TIMEOUT_MS = 1000        # 单次 TLS 握手超时
 PING_CONCURRENCY = 50         # 并发数
 
-LATENCY_MAX_MS = 800          # 延迟上限, 超过的不入选
+LATENCY_MAX_MS = 1000          # 延迟上限, 超过的不入选
 TOP_N = 15                    # 最终取前几个
 MIN_TOTAL = 7                 # 入选少于该值则不上传 Release
 
