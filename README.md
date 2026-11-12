@@ -94,8 +94,8 @@ https://github.com/4evergr8/CFAutoTest/releases/download/latest/result.txt
 ## 本地运行
 
 ```bash
-python node_speedtest.py                  # 全量
-python node_speedtest.py --limit 20       # 只测前 20 个，用于试跑
+python cf_node_speedtest.py                  # 全量
+python cf_node_speedtest.py --limit 20       # 只测前 20 个，用于试跑
 ```
 
 只依赖 Python 标准库，Python 3.8+ 均可，无需安装任何第三方包。
@@ -104,7 +104,7 @@ python node_speedtest.py --limit 20       # 只测前 20 个，用于试跑
 
 1. 脚本上传到 `/ql/data/scripts/`，与青龙的 `notify.py` 同目录
 2. 环境变量里加上 `GITHUB_REPO`、`GITHUB_TOKEN`（可选 `PROXY`）
-3. 新建任务，命令 `task node_speedtest.py`
+3. 新建任务，命令 `task cf_node_speedtest.py`
 4. 定时规则 `0 2,7,12,17,22 * * *`（每 5 小时一次，避开 05、06 点）
 
 脚本头部已按青龙规范写好：
