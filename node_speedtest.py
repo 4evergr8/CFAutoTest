@@ -58,9 +58,7 @@ MIN_TOTAL = 7                 # 总数低于该值视为本轮失败: 不上传 
 SPEED_MAX_BYTES = 25 * 1024 * 1024
 VERIFY_TLS = True             # 是否校验证书
 
-# 提前终止时间由阈值推导: 25MB 若要达到 8 MB/s 必须在 3.125s 内下完,
-# 超过该时间仍未下完即不可能达标, 直接放弃 (留 5% 余量避免边界误杀)
-EARLY_STOP_SEC = SPEED_MAX_BYTES / (SPEED_MIN_MBPS * 1024 * 1024) * 1.05
+EARLY_STOP_SEC = 5.0          # 单次测速最长等待时间, 超时即放弃(兼作 socket 超时)
 
 OUT_DIR = "."                 # 输出目录(相对脚本所在目录), "." 表示与脚本同目录
 OUT_TXT = "result.txt"
@@ -254,7 +252,7 @@ def main():
               f"并发 {PING_CONCURRENCY})")
         print(f"  速度阈值  : >= {SPEED_MIN_MBPS} MB/s (凑不满时用 >= {LOW_SPEED_MIN_MBPS} MB/s 补齐)")
         print(f"  单次样本  : {SPEED_MAX_BYTES // 1024 // 1024} MB")
-        print(f"  提前终止  : {EARLY_STOP_SEC:.1f} s (样本未下完即不可能达标, 兼作 socket 超时)")
+        print(f"  提前终止  : {EARLY_STOP_SEC:.1f} s (超时即放弃, 兼作 socket 超时)")
         print(f"  每国配额  : {MAX_PER_COUNTRY} 个")
         print(f"  输出目录  : {BASE / OUT_DIR} ({OUT_TXT} / {OUT_CSV})")
         if GITHUB_REPO and GITHUB_TOKEN:
