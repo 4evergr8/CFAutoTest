@@ -18,8 +18,8 @@ new Env('CF 反代优选')
     PROXY         下载/上传用的代理, 例 192.168.123.100:7890 (先走代理, 失败再直连)
 
 用法:
-    python node_speedtest.py            # 全量跑
-    python node_speedtest.py --limit 20 # 只跑前 20 个(用于试跑)
+    python cf_node_speedtest.py            # 全量跑
+    python cf_node_speedtest.py --limit 20 # 只跑前 20 个(用于试跑)
 """
 import argparse
 import asyncio
