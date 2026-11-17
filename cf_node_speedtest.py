@@ -581,9 +581,9 @@ def main():
         print(f"\n[异常] {title}")
         print(body)
 
-        from notify import send
-        send(title, body)
-        print("[通知] 已推送")
+        # from notify import send
+        # send(title, body)
+        # print("[通知] 已推送")
         sys.exit(1)
 
 
