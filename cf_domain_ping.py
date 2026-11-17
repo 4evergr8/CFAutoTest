@@ -6,7 +6,7 @@ new Env('CF 域名优选')
 CF 优选域名延迟筛选
 
 流程: 下载域名列表 -> 系统 DNS 解析 IPv4 -> 只保留 CF 网段 -> 并发 TLS 握手(SNI=域名)
-      -> 排序取前 N -> 写 txt/csv -> 上传 GitHub Release
+      每个 IP 测 N 次取平均, 域名取各 IP 最小 -> 排序取前 N -> 写 txt/csv -> 上传 GitHub Release
 
 环境变量:
     GITHUB_REPO   owner/repo, 例 4evergr8/CFAutoTest
@@ -37,7 +37,7 @@ from urllib.parse import urlparse
 SOURCE_URL = "https://raw.githubusercontent.com/cmliu/CF-Pages-BestCF/main/cf_domains.txt"
 PORT = 443
 
-PING_ATTEMPTS = 3             # 每个 IP 测几次, 取最小值
+PING_ATTEMPTS = 3             # 每个 IP 测几次, 取平均值作为该 IP 成绩
 PING_TIMEOUT_MS = 2000        # 单次 TLS 握手超时(含完整握手, 别设太小)
 PING_CONCURRENCY = 50         # 并发数(TLS 握手吃 CPU, 太高会虚高)
 
@@ -115,10 +115,11 @@ def download():
 
 
 def fetch(req, timeout=NET_TIMEOUT):
-    """GitHub API 用: 裸连 -> 局域网 clash, 返回 (status, body, err)"""
-    plans = [({}, "裸连")]
+    """先走代理, 失败再直连, 各尝试一次。返回 (status, body, err)"""
+    plans = []
     if PROXY_URL:
-        plans.append(({"http": PROXY_URL, "https": PROXY_URL}, f"clash {PROXY}"))
+        plans.append(({"http": PROXY_URL, "https": PROXY_URL}, "代理"))
+    plans.append(({}, "直连"))
 
     def clone():
         r = urllib.request.Request(req.full_url, data=req.data, method=req.get_method())
@@ -143,7 +144,7 @@ def fetch(req, timeout=NET_TIMEOUT):
 
 
 async def probe(dom, sem):
-    """解析域名的 A 记录, 只保留 CF 网段, 逐个做 TLS 握手, 取最小耗时"""
+    """每个 IP 测 N 次取平均作为该 IP 成绩, 域名取所有 IP 成绩里的最小值"""
     async with sem:
         try:
             loop = asyncio.get_running_loop()
@@ -158,22 +159,26 @@ async def probe(dom, sem):
 
         best, best_ip, err = None, "", ""
         for ip in ips:
+            vals = []
             for _ in range(PING_ATTEMPTS):
                 t0 = time.perf_counter()
                 try:
                     _, w = await asyncio.wait_for(
                         asyncio.open_connection(ip, PORT, ssl=TLS_CTX, server_hostname=dom),
                         PING_TIMEOUT_MS / 1000)
-                    dt = (time.perf_counter() - t0) * 1000
+                    vals.append((time.perf_counter() - t0) * 1000)
                     w.close()
                     try:
                         await asyncio.wait_for(w.wait_closed(), 0.3)
                     except Exception:
                         pass
-                    if best is None or dt < best:
-                        best, best_ip = dt, ip
                 except Exception as e:
                     err = type(e).__name__
+            if not vals:
+                continue
+            avg = sum(vals) / len(vals)
+            if best is None or avg < best:
+                best, best_ip = avg, ip
         if best is None:
             return {"domain": dom, "ip": ips[0], "ping_ms": None,
                     "status": err or "fail"}
@@ -202,7 +207,7 @@ def main():
         print("CF 优选域名延迟筛选")
         print(f"  列表来源  : {SOURCE_URL}")
         print(f"  入选条件  : 解析到 CF 网段 且 TLS 握手 <= {LATENCY_MAX_MS} ms, 取前 {TOP_N} 个")
-        print(f"  测试方式  : 每个 A 记录测 {PING_ATTEMPTS} 次取最小, 并发 {PING_CONCURRENCY}")
+        print(f"  测试方式  : 每个 IP 测 {PING_ATTEMPTS} 次取平均, 域名取各 IP 最小, 并发 {PING_CONCURRENCY}")
         print(f"  单次超时  : {PING_TIMEOUT_MS} ms")
         print(f"  网络代理  : {PROXY_URL or '未配置'}")
         print(f"  反代列表  : {', '.join(urlparse(m).netloc for m in GITHUB_MIRRORS) or '无'}")
