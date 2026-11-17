@@ -14,6 +14,7 @@ CF 优选域名延迟筛选
     RELEASE_TAG   Release 标签, 默认 latest
     RELEASE_NAME  Release 标题, 可选
     PROXY         局域网 clash, 例 192.168.123.100:7890
+    SNI           TLS 握手用的 SNI, 留空则用域名自身
 """
 import asyncio
 import csv
@@ -60,6 +61,7 @@ LIST_FILE = "cf_domains.txt"
 # 下载顺序: 裸连 -> 局域网 clash -> GitHub 反代(按列表顺序)
 PROXY = os.environ.get("PROXY", "192.168.123.100:7890").strip()   # 局域网 clash, 置空则跳过
 PROXY_URL = f"http://{PROXY}" if PROXY else ""
+SNI = os.environ.get("SNI", "").strip()                           # 握手用的 SNI, 留空则用域名自身
 GITHUB_MIRRORS = [
     "https://ghfast.top/",
     "https://gh-proxy.com/",
@@ -164,7 +166,7 @@ async def probe(dom, sem):
                 t0 = time.perf_counter()
                 try:
                     _, w = await asyncio.wait_for(
-                        asyncio.open_connection(ip, PORT, ssl=TLS_CTX, server_hostname=dom),
+                        asyncio.open_connection(ip, PORT, ssl=TLS_CTX, server_hostname=SNI or dom),
                         PING_TIMEOUT_MS / 1000)
                     vals.append((time.perf_counter() - t0) * 1000)
                     w.close()
@@ -208,6 +210,7 @@ def main():
         print(f"  列表来源  : {SOURCE_URL}")
         print(f"  入选条件  : 解析到 CF 网段 且 TLS 握手 <= {LATENCY_MAX_MS} ms, 取前 {TOP_N} 个")
         print(f"  测试方式  : 每个 IP 测 {PING_ATTEMPTS} 次取平均, 域名取各 IP 最小, 并发 {PING_CONCURRENCY}")
+        print(f"  握手 SNI  : {SNI or '域名自身'}")
         print(f"  单次超时  : {PING_TIMEOUT_MS} ms")
         print(f"  网络代理  : {PROXY_URL or '未配置'}")
         print(f"  反代列表  : {', '.join(urlparse(m).netloc for m in GITHUB_MIRRORS) or '无'}")
