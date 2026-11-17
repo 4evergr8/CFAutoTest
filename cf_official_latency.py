@@ -394,12 +394,12 @@ def main():
         )
         print(f"\n[异常] {title}")
         print(body)
-        try:
-            from notify import send
-            send(title, body)
-            print("[通知] 已推送")
-        except ImportError:
-            print("[通知] 未找到 notify.py, 跳过推送")
+        # try:
+        #     from notify import send
+        #     send(title, body)
+        #     print("[通知] 已推送")
+        # except ImportError:
+        #     print("[通知] 未找到 notify.py, 跳过推送")
         sys.exit(1)
 
 
