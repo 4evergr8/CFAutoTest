@@ -5,7 +5,7 @@ new Env('CF 域名优选')
 
 CF 优选域名延迟筛选
 
-流程: 下载域名列表 -> 系统 DNS 解析 IPv4 -> 只保留 CF 网段 -> 并发 TLS 握手(SNI=域名)
+流程: 下载域名列表 -> DoT 解析 IPv4 -> 只保留 CF 网段 -> 并发 TLS 握手(SNI=域名)
       每个 IP 测 N 次取平均, 域名取各 IP 最小 -> 排序取前 N -> 写 txt/csv -> 上传 GitHub Release
 
 环境变量:
@@ -23,6 +23,7 @@ import json
 import os
 import socket
 import ssl
+import struct
 import sys
 import time
 import traceback
@@ -37,6 +38,12 @@ from urllib.parse import urlparse
 
 SOURCE_URL = "https://raw.githubusercontent.com/cmliu/CF-Pages-BestCF/main/cf_domains.txt"
 PORT = 443
+
+# 域名解析走 DoT (tls://host:port, 端口默认 853)
+DNS = "tls://223.5.5.5"
+DNS_SNI = "dns.alidns.com"    # 证书校验用的 SNI, 留空则用 DNS 里的主机名
+DNS_TIMEOUT = 5.0             # 单次查询超时(秒)
+DNS_CONCURRENCY = 10          # 查询并发, 每次新建 TLS 连接, 太高会被限流
 
 PING_ATTEMPTS = 3             # 每个 IP 测几次, 取平均值作为该 IP 成绩
 PING_TIMEOUT_MS = 2000        # 单次 TLS 握手超时(含完整握手, 别设太小)
@@ -85,6 +92,54 @@ if hasattr(sys.stdout, "reconfigure"):
 
 TLS_CTX = ssl.create_default_context()
 CF_NETS = [ipaddress.ip_network(c) for c in CF_CIDRS]
+
+_u = urlparse(DNS)
+if _u.scheme != "tls":
+    raise SystemExit(f"DNS 只支持 tls:// 形式, 当前: {DNS}")
+DNS_HOST = _u.hostname
+DNS_PORT = _u.port or 853
+DNS_SNI = DNS_SNI or DNS_HOST
+
+
+def skip_name(b, i):
+    """跳过 DNS 报文里的域名(含压缩指针)"""
+    while True:
+        n = b[i]
+        if n == 0:
+            return i + 1
+        if n & 0xC0 == 0xC0:
+            return i + 2
+        i += 1 + n
+
+
+def dns_a(dom):
+    """DoT 查询 A 记录, 返回 IP 列表"""
+    q = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
+    for p in dom.rstrip(".").split("."):
+        q += bytes([len(p)]) + p.encode()
+    q += b"\x00" + struct.pack(">HH", 1, 1)
+
+    with socket.create_connection((DNS_HOST, DNS_PORT), DNS_TIMEOUT) as s:
+        with TLS_CTX.wrap_socket(s, server_hostname=DNS_SNI) as ss:
+            ss.sendall(struct.pack(">H", len(q)) + q)
+            n = struct.unpack(">H", ss.recv(2))[0]
+            buf = b""
+            while len(buf) < n:
+                buf += ss.recv(n - len(buf))
+
+    qd, an = struct.unpack(">HH", buf[4:8])
+    i = 12
+    for _ in range(qd):
+        i = skip_name(buf, i) + 4
+    ips = []
+    for _ in range(an):
+        i = skip_name(buf, i)
+        typ, _, _, rdlen = struct.unpack(">HHIH", buf[i:i + 10])
+        i += 10
+        if typ == 1 and rdlen == 4:
+            ips.append(socket.inet_ntoa(buf[i:i + 4]))
+        i += rdlen
+    return ips
 
 
 def is_cf(ip):
@@ -145,13 +200,13 @@ def fetch(req, timeout=NET_TIMEOUT):
     return None, b"", last
 
 
-async def probe(dom, sem):
+async def probe(dom, sem, dns_sem):
     """每个 IP 测 N 次取平均作为该 IP 成绩, 域名取所有 IP 成绩里的最小值"""
     async with sem:
         try:
             loop = asyncio.get_running_loop()
-            ips = await loop.run_in_executor(None, socket.gethostbyname_ex, dom)
-            ips = ips[2]
+            async with dns_sem:
+                ips = await loop.run_in_executor(None, dns_a, dom)
         except Exception as e:
             return {"domain": dom, "ip": "", "ping_ms": None,
                     "status": f"dns_{type(e).__name__}"}
@@ -189,7 +244,8 @@ async def probe(dom, sem):
 
 async def run(domains):
     sem = asyncio.Semaphore(PING_CONCURRENCY)
-    tasks = [asyncio.create_task(probe(d, sem)) for d in domains]
+    dns_sem = asyncio.Semaphore(DNS_CONCURRENCY)
+    tasks = [asyncio.create_task(probe(d, sem, dns_sem)) for d in domains]
     out = []
     for i, t in enumerate(asyncio.as_completed(tasks), 1):
         r = await t
@@ -208,6 +264,7 @@ def main():
         print("=" * 68)
         print("CF 优选域名延迟筛选")
         print(f"  列表来源  : {SOURCE_URL}")
+        print(f"  DNS 解析  : {DNS} (DoT, SNI {DNS_SNI})")
         print(f"  入选条件  : 解析到 CF 网段 且 TLS 握手 <= {LATENCY_MAX_MS} ms, 取前 {TOP_N} 个")
         print(f"  测试方式  : 每个 IP 测 {PING_ATTEMPTS} 次取平均, 域名取各 IP 最小, 并发 {PING_CONCURRENCY}")
         print(f"  握手 SNI  : {SNI or '域名自身'}")
