@@ -50,7 +50,7 @@ PING_TIMEOUT_MS = 2000        # 单次 TLS 握手超时(含完整握手, 别设�
 PING_CONCURRENCY = 50         # 并发数(TLS 握手吃 CPU, 太高会虚高)
 
 LATENCY_MAX_MS = 800          # 延迟上限, 超过的不入选(含 TLS, 比纯 RTT 大 3-5 倍)
-TOP_N = 15                    # 最终取前几个
+TOP_N = 20                   # 最终取前几个
 
 # 只测落在这些网段里的 A 记录(Cloudflare 官方 ips-v4)
 CF_CIDRS = [
